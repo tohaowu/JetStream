@@ -182,6 +182,8 @@ class ActiveRequest:
   )
   ################## Id of the adapter ###################
   adapter_id: str = ""
+  ################ Whether the prefill content has bos or not #################
+  has_bos: bool = False
 
   def enqueue_samples(self, generated_samples: list[ReturnSample]):
     """Adds the generated sample(s) to return channel for current step.
@@ -600,10 +602,11 @@ class Driver:
       self,
       request: ActiveRequest,
       tokenizer: tokenizer_api.Tokenizer,
-      is_bos: bool,
       max_prefill_length: int,
   ) -> Tuple[jax.Array | np.ndarray, int]:
     content = request.prefill_content
+    # Add bos token if the prefill content doesn't have bos.
+    is_bos = not request.has_bos
     if isinstance(content, str):
       # If it's text input, tokenize and pad the input.
       return tokenizer.encode(
@@ -614,6 +617,7 @@ class Driver:
       )
     else:
       # If it's token input, pad the input.
+      content = np.array(content)
       return token_utils.pad_tokens(
           content,
           tokenizer.bos_id,
@@ -726,31 +730,17 @@ class Driver:
     chunk_size = prefill_engine.prefill_chunk_size
 
     # 1. Load the longest possible prefix from the cache
-    load_result = prefix_cache.load_existing_prefix(
-        self._prefix_cache, tuple_tokens, chunk_size
+    existing_prefix, remain_tokens = (
+        prefix_cache.load_existing_prefix_and_get_remain_tokens(
+            self._prefix_cache, tokens, chunk_size
+        )
     )
 
-    existing_prefix = None
-    remain_tokens = tokens  # Assume full prefill initially
-    original_common_prefix_len = 0
-
-    if load_result:
-      existing_prefix, original_common_prefix_len = load_result
-      # Calculate the tokens that still need to be prefilled
-      # common_prefix_tokens is already truncated to chunk_size multiple
-      # and ensures at least one token remains.
-      truncated_len = existing_prefix.common_prefix_tokens.shape[0]
-      remain_tokens = tokens[truncated_len:]
+    if existing_prefix is not None:
       logger.debug(
-          "Prefix cache hit. Original common length: %d, Truncated length: %d,"
-          " Remaining tokens to prefill: %d",
-          original_common_prefix_len,
-          truncated_len,
+          "Prefix cache hit length: %d, Remaining tokens len to prefill: %d",
+          len(existing_prefix.common_prefix_tokens),
           len(remain_tokens),
-      )
-    else:
-      logger.debug(
-          "Prefix cache miss or prefix too short. Prefilling all tokens."
       )
 
     # 2. Perform chunked prefill on the remaining tokens
@@ -804,18 +794,16 @@ class Driver:
       if request is None:
         break
       request.metadata.prefill_dequeue_time = time.perf_counter()
-      is_bos = True
       ThreadDebugLog(
           thread_name,
           f"Executing prefilling for one ActiveRequest. Current prefill "
           f"backlog size: {self._prefill_backlog.qsize()},"
-          f" is_bos: {is_bos}",
+          f" has_bos: {request.has_bos}",
       )
       # Tokenize and padding the text or token input.
       padded_tokens, true_length = self._process_prefill_content(
           request,
           tokenizer,
-          is_bos,
           prefill_engine.max_prefill_length,
       )
 
@@ -1704,6 +1692,7 @@ class LLMOrchestrator(jetstream_pb2_grpc.OrchestratorServicer):
             prefill_enqueue_time=time.perf_counter(),
         ),
         num_samples=request.num_samples if request.num_samples else 1,
+        has_bos=request.has_bos,
     )
     # The first stage is being prefilled, all other stages are handled
     # inside the driver (transfer, generate*N, detokenize).
